@@ -1,0 +1,15 @@
+{
+    "timestamp": "2025-02-13T09:07:32.192118",
+    "symbol": "RELIANCE.NS",
+    "current_price": 1216.949951171875,
+    "predictions": {
+        "cnn": 1223.373382627964,
+        "lstm": 1250.6355191329494,
+        "ensemble": 1237.0044507980347
+    },
+    "model_weights": [
+        0.5,
+        0.5
+    ],
+    "evaluation_time": "2025-02-13T09:37:32.192118"
+}
