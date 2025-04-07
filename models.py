@@ -1,131 +1,88 @@
 import torch
 import torch.nn as nn
-import math
+import torch.nn.functional as F
 
-class CustomLSTM(nn.Module):
-    def __init__(self, input_sz, hidden_sz, peephole=False, dropout_prob=0.1):
+class CNN(nn.Module):
+    def __init__(self, input_size=9, hidden_size=64, dropout_prob=0.2):
         super().__init__()
-        self.input_sz = input_sz
-        self.hidden_size = hidden_sz
-        self.peephole = peephole
-        self.U = nn.Parameter(torch.Tensor(input_sz, hidden_sz * 4))
-        self.W = nn.Parameter(torch.Tensor(hidden_sz, hidden_sz * 4))
-        self.dropout_prob = dropout_prob
-        self.bias = nn.Parameter(torch.Tensor(hidden_sz * 4))
-        self.init_weights()
-        self.dropout = nn.Dropout(dropout_prob)
-
-    def init_weights(self):
-        stdv = 1.0 / math.sqrt(self.hidden_size)
-        for weight in self.parameters():
-            weight.data.uniform_(-stdv, stdv)
-
-    def forward(self, x, init_states=None):
-        bs, seq_sz, _ = x.size()
-        hidden_seq = []
-
-        if init_states is None:
-            h_t = torch.zeros(bs, self.hidden_size).to(x.device)
-            c_t = torch.zeros(bs, self.hidden_size).to(x.device)
-        else:
-            h_t, c_t = init_states
-
-        for t in range(seq_sz):
-            x_t = x[:, t, :]
-
-            # Get all 4 gates using one big matrix multiplication
-            gates = x_t @ self.U + h_t @ self.W + self.bias
-
-            # Split gates
-            i_t, f_t, g_t, o_t = (
-                torch.sigmoid(gates[:, :self.hidden_size]),                # input
-                torch.sigmoid(gates[:, self.hidden_size:self.hidden_size*2]),  # forget
-                torch.tanh(gates[:, self.hidden_size*2:self.hidden_size*3]),   # cell
-                torch.sigmoid(gates[:, self.hidden_size*3:]),             # output
-            )
-
-            if self.peephole:
-                i_t = i_t * c_t
-                f_t = f_t * c_t
-
-            c_t = f_t * c_t + i_t * g_t
-
-            if self.peephole:
-                o_t = o_t * c_t
-
-            h_t = o_t * torch.tanh(c_t)
-            h_t = self.dropout(h_t)
-
-            hidden_seq.append(h_t.unsqueeze(0))
-
-        hidden_seq = torch.cat(hidden_seq, dim=0)
-        hidden_seq = hidden_seq.transpose(0, 1).contiguous()
-
-        return hidden_seq, (h_t, c_t)
-
-class cnn_for_time_series(nn.Module):
-    def __init__(self, hidden_size1=128, hidden_size2=64, dropout_prob=0.3):
-        super().__init__()
-        self.conv1 = nn.Conv2d(in_channels=1, out_channels=hidden_size1, kernel_size=(3,3), stride=1, padding=1)
-        self.pool = nn.MaxPool2d(kernel_size=(2,2), stride=1)
-        self.drop = nn.Dropout(p=dropout_prob)
+        self.features = nn.Sequential(
+            nn.Conv1d(input_size, hidden_size, kernel_size=3, padding=1),
+            nn.BatchNorm1d(hidden_size),
+            nn.LeakyReLU(),
+            nn.MaxPool1d(kernel_size=2),
+            nn.Dropout(p=dropout_prob),
+            
+            nn.Conv1d(hidden_size, 32, kernel_size=3, padding=1),
+            nn.BatchNorm1d(32),
+            nn.LeakyReLU(),
+            nn.MaxPool1d(kernel_size=2),
+            nn.Dropout(p=dropout_prob)
+        )
         
-        self.conv2 = nn.Conv2d(in_channels=hidden_size1, out_channels=hidden_size2, kernel_size=(3,3), stride=1)
+        # Calculate output size after convolutions
+        self.feature_size = 32 * 3  # After 2 max pooling layers
         
-        self.fc1 = nn.Linear(hidden_size2 * 12 * 2, 64)
-        self.fc2 = nn.Linear(64, 1)
-
+        self.classifier = nn.Sequential(
+            nn.Linear(self.feature_size, 32),
+            nn.BatchNorm1d(32),
+            nn.LeakyReLU(),
+            nn.Dropout(p=dropout_prob),
+            nn.Linear(32, 1)
+        )
+    
     def forward(self, x):
-        x = self.conv1(x)
-        x = self.pool(x)
-        x = self.drop(x)
-        
-        x = self.conv2(x)
-        x = self.drop(x)
-        
-        x = torch.flatten(x, 1)
-        x = self.fc1(x)
-        x = self.fc2(x)
-        
+        # Reshape input for 1D convolution (batch_size, channels, sequence_length)
+        x = x.permute(0, 2, 1)
+        x = self.features(x)
+        x = x.view(x.size(0), -1)
+        x = self.classifier(x)
+        return x
+
+class LSTM(nn.Module):
+    def __init__(self, input_size=9, hidden_size=64, num_layers=2, dropout_prob=0.2):
+        super().__init__()
+        self.lstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=dropout_prob if num_layers > 1 else 0,
+            batch_first=True,
+            bidirectional=True  # Use bidirectional LSTM
+        )
+        self.bn = nn.BatchNorm1d(hidden_size * 2)  # *2 for bidirectional
+        self.dropout = nn.Dropout(dropout_prob)
+        self.fc = nn.Linear(hidden_size * 2, 1)
+    
+    def forward(self, x):
+        lstm_out, _ = self.lstm(x)
+        x = lstm_out[:, -1, :]  # Take last sequence output
+        x = self.bn(x)
+        x = F.leaky_relu(x)
+        x = self.dropout(x)
+        x = self.fc(x)
         return x
 
 class EnsembleModel(nn.Module):
-    def __init__(self, cnn_hidden_size1=128, cnn_hidden_size2=64, lstm_input_size=5, lstm_hidden_size=64, dropout_prob=0.3):
+    def __init__(self, input_size=9, hidden_size=64):
         super().__init__()
-        self.cnn = cnn_for_time_series(hidden_size1=cnn_hidden_size1, hidden_size2=cnn_hidden_size2, dropout_prob=dropout_prob)
-        self.lstm = CustomLSTM(input_sz=lstm_input_size, hidden_sz=lstm_hidden_size, dropout_prob=dropout_prob)
+        self.cnn = CNN(input_size=input_size, hidden_size=hidden_size)
+        self.lstm = LSTM(input_size=input_size, hidden_size=hidden_size)
         
-        # Additional layer to convert LSTM output to prediction
-        self.lstm_out = nn.Linear(lstm_hidden_size, 1)
+        # Initialize weights with a slight bias towards positive predictions
+        self.weight_cnn = nn.Parameter(torch.tensor([0.6]))
+        self.weight_lstm = nn.Parameter(torch.tensor([0.4]))
         
-        # Weighted average of predictions
-        self.cnn_weight = nn.Parameter(torch.tensor(0.5))
-        self.lstm_weight = nn.Parameter(torch.tensor(0.5))
-        
-    def load_cnn_model(self, cnn_path):
-        checkpoint = torch.load(cnn_path, map_location=torch.device('cpu'))
-        self.cnn.load_state_dict(checkpoint['model_state_dict'])
-        
-    def load_lstm_model(self, lstm_path):
-        checkpoint = torch.load(lstm_path, map_location=torch.device('cpu'))
-        self.lstm.load_state_dict(checkpoint['model_state_dict'])
+        # Add a small bias term
+        self.bias = nn.Parameter(torch.tensor([0.001]))
     
     def forward(self, x, return_individual=False):
-        # Prepare input for CNN (add channel dimension)
-        cnn_input = x.unsqueeze(1)  # Shape: [batch_size, 1, seq_len, features]
-        cnn_pred = self.cnn(cnn_input)
-        
-        # Prepare input for LSTM
-        lstm_seq, _ = self.lstm(x)  # Shape: [batch_size, seq_len, hidden_size]
-        lstm_last = lstm_seq[:, -1, :]  # Take last timestep
-        lstm_pred = self.lstm_out(lstm_last)  # Convert to prediction
+        cnn_pred = self.cnn(x)
+        lstm_pred = self.lstm(x)
         
         # Normalize weights using softmax
-        weights = torch.softmax(torch.tensor([self.cnn_weight, self.lstm_weight]), dim=0)
-        
-        # Weighted average of predictions
-        ensemble_pred = weights[0] * cnn_pred + weights[1] * lstm_pred
+        weights = F.softmax(torch.stack([self.weight_cnn, self.weight_lstm]), dim=0)
+        ensemble_pred = weights[0] * cnn_pred + weights[1] * lstm_pred + self.bias
         
         if return_individual:
-            return ensemble_pred, cnn_pred, lstm_pred, weights
+            return ensemble_pred, cnn_pred, lstm_pred, weights.detach().numpy()
         return ensemble_pred
